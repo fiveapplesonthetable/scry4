@@ -318,7 +318,14 @@ func indexStream(a indexArgs) {
 	defer os.RemoveAll(staging)
 
 	// In-process GraphStore (creates if absent; reused on resume).
-	gs, err := leveldb.OpenGraphStore(a.graphstore, nil)
+	// Bulk-load tuning: a large write buffer + cache turns the fold from
+	// compaction-bound (default 60 MB buffer → constant merges) into mostly
+	// sequential SSTable writes — critical for the multi-GB entry streams big
+	// Java CUs produce.
+	gs, err := leveldb.OpenGraphStore(a.graphstore, &leveldb.Options{
+		WriteBufferSize: 1 << 30, // 1 GB memtable (bulk load — fewer compactions)
+		CacheCapacity:   512 << 20,
+	})
 	if err != nil {
 		die("open graphstore: %v", err)
 	}
@@ -377,61 +384,91 @@ func indexStream(a indexArgs) {
 			workers = 1
 		}
 	}
-	// Decouple indexing (parallel) from folding (serial, single LevelDB
-	// writer): workers run indexers and write each CU's entries to a temp
-	// file, then hand the path to a single folder goroutine via a bounded
-	// channel. Folding never blocks the indexers, and the bounded channel
-	// caps how many entry files sit on disk at once.
+	// Three stages: indexer workers (parallel) → entry files → N DECODER
+	// goroutines (parallel proto-decode + name extraction, the CPU-heavy part)
+	// → 1 WRITER goroutine (the single LevelDB writer). Decoding used to be on
+	// the same goroutine as the write, so one core fed LevelDB while ~70 sat
+	// idle; parallel decode keeps the writer saturated.
 	type job struct{ digest, path string }
 	ch := make(chan job, workers*2)
 
-	var folderWg sync.WaitGroup
-	folderWg.Add(1)
+	// writeItem: either a WriteRequest to fold, or a per-file "done" marker.
+	// A decoder enqueues all of a file's requests (in order) then its marker;
+	// the single writer is FIFO, so by the time it sees the marker every
+	// request for that file has been written → safe to log done + delete.
+	type writeItem struct {
+		req  *spb.WriteRequest
+		done string // digest (set on the completion marker)
+		path string // entry file to delete on completion
+	}
+	writeCh := make(chan writeItem, 512)
+
+	// Single LevelDB writer.
+	var writerWg sync.WaitGroup
+	writerWg.Add(1)
 	go func() {
-		defer folderWg.Done()
-		for j := range ch {
-			ef, err := os.Open(j.path)
-			if err != nil {
-				os.Remove(j.path)
+		defer writerWg.Done()
+		for it := range writeCh {
+			if it.req != nil {
+				_ = gs.Write(ctx, it.req)
 				continue
 			}
-			reqs := graphstore.BatchWrites(stream.ReadEntries(ef), 1024)
-			for req := range reqs {
-				_ = gs.Write(ctx, req) // single writer — no mutex needed
-				if !wantNames {
-					continue
-				}
-				ticket := kytheuri.ToString(req.GetSource())
-				for _, u := range req.GetUpdate() {
-					if u.GetEdgeKind() == "/kythe/edge/named" && u.GetTarget().GetSignature() != "" {
-						sig := u.GetTarget().GetSignature()
-						addName(sig, ticket)
-						if p, ok := stripJVMDesc(sig); ok {
-							addName(p, ticket)
-						}
-					} else if u.GetFactName() == "/kythe/code" && len(u.GetFactValue()) > 0 {
-						var ms cpb.MarkedSource
-						if proto.Unmarshal(u.GetFactValue(), &ms) == nil {
-							if si := markedsource.RenderQualifiedName(&ms); si.GetQualifiedName() != "" {
-								addName(si.GetQualifiedName(), ticket)
-							}
-						}
-					}
-				}
-			}
-			ef.Close()
-			os.Remove(j.path)
+			os.Remove(it.path)
 			stats.mu.Lock()
 			stats.ok++
 			stats.mu.Unlock()
-			logDone(j.digest)
+			logDone(it.done)
 			n := atomic.AddInt64(&idxDone, 1)
 			if n%200 == 0 {
-				fmt.Fprintf(os.Stderr, "scry4: folded %d/%d (graphstore %s)\n", n, len(plan),
-					func() string { fi, _ := os.Stat(a.graphstore); _ = fi; return "" }())
+				fmt.Fprintf(os.Stderr, "scry4: folded %d/%d\n", n, len(plan))
 			}
 		}
 	}()
+
+	// N parallel decoders.
+	decoders := workers
+	if decoders < 2 {
+		decoders = 2
+	}
+	var decWg sync.WaitGroup
+	for d := 0; d < decoders; d++ {
+		decWg.Add(1)
+		go func() {
+			defer decWg.Done()
+			for j := range ch {
+				ef, err := os.Open(j.path)
+				if err != nil {
+					os.Remove(j.path)
+					continue
+				}
+				reqs := graphstore.BatchWrites(stream.ReadEntries(ef), 8192)
+				for req := range reqs {
+					if wantNames {
+						ticket := kytheuri.ToString(req.GetSource())
+						for _, u := range req.GetUpdate() {
+							if u.GetEdgeKind() == "/kythe/edge/named" && u.GetTarget().GetSignature() != "" {
+								sig := u.GetTarget().GetSignature()
+								addName(sig, ticket)
+								if p, ok := stripJVMDesc(sig); ok {
+									addName(p, ticket)
+								}
+							} else if u.GetFactName() == "/kythe/code" && len(u.GetFactValue()) > 0 {
+								var ms cpb.MarkedSource
+								if proto.Unmarshal(u.GetFactValue(), &ms) == nil {
+									if si := markedsource.RenderQualifiedName(&ms); si.GetQualifiedName() != "" {
+										addName(si.GetQualifiedName(), ticket)
+									}
+								}
+							}
+						}
+					}
+					writeCh <- writeItem{req: req}
+				}
+				ef.Close()
+				writeCh <- writeItem{done: j.digest, path: j.path}
+			}
+		}()
+	}
 
 	var next int64 = -1
 	var wg sync.WaitGroup
@@ -513,9 +550,11 @@ func indexStream(a indexArgs) {
 			}
 		}()
 	}
-	wg.Wait()
-	close(ch)
-	folderWg.Wait()
+	wg.Wait()       // all indexers done producing entry files
+	close(ch)       // decoders drain remaining files
+	decWg.Wait()    // all decoders done enqueuing requests + markers
+	close(writeCh)  // writer drains remaining requests
+	writerWg.Wait() // single LevelDB writer done
 	if wantNames {
 		nameFile.Flush()
 	}
