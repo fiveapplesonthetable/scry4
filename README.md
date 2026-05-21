@@ -46,7 +46,8 @@ scry4 <serving> def      android::Parcel::writeStrongBinder
 scry4 <serving> ref      android::Parcel::writeInt32
 scry4 <serving> callers  android::Parcel::writeInt32
 scry4 <serving> super NAME / sub NAME      [--in S] [--not-in S]
-scry4 <serving> callgraph NAME --direction up|down|both --depth N
+scry4 <serving> callgraph NAME --direction up|down|both --depth N [--max-syms N] [--root-limit N]
+#   all query verbs accept: --substr --in --not-in --def-in --limit/--max-hits  (exact scry2 flag parity)
 scry4 <serving> edges NAME / nodes NAME / identifier NAME
 scry4 <serving> repl                       # warm in-process loop — the fast path
 scry4 <serving> stat

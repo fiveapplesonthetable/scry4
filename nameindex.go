@@ -21,7 +21,10 @@ import (
 // writes (TAB-separated, one pair per line), so scry3 and scry4 share index
 // files interchangeably.
 type nameRow struct{ name, ticket string }
-type nameIndex struct{ rows []nameRow }
+type nameIndex struct {
+	rows     []nameRow
+	byTicket map[string]string // ticket → shortest (canonical) name, for reverse display
+}
 
 func loadNameIndex(path string) (*nameIndex, error) {
 	f, err := os.Open(path)
@@ -41,7 +44,24 @@ func loadNameIndex(path string) (*nameIndex, error) {
 	if !sort.SliceIsSorted(rows, func(i, j int) bool { return rows[i].name < rows[j].name }) {
 		sort.SliceStable(rows, func(i, j int) bool { return rows[i].name < rows[j].name })
 	}
-	return &nameIndex{rows: rows}, nil
+	byTicket := make(map[string]string, len(rows))
+	for _, r := range rows {
+		// Prefer the shortest name per ticket (canonical FQN over a
+		// descriptor-suffixed alias).
+		if cur, ok := byTicket[r.ticket]; !ok || len(r.name) < len(cur) {
+			byTicket[r.ticket] = r.name
+		}
+	}
+	return &nameIndex{rows: rows, byTicket: byTicket}, nil
+}
+
+// nameOf returns a human name for a ticket via the reverse map, falling back
+// to the ticket's signature.
+func (ni *nameIndex) nameOf(ticket string) string {
+	if n, ok := ni.byTicket[ticket]; ok {
+		return n
+	}
+	return ""
 }
 
 func (ni *nameIndex) lookup(name string, substr bool) []string {

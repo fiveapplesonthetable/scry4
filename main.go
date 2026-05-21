@@ -47,7 +47,8 @@ USAGE:
   scry4 <serving> build <graphstore-dir>             graphstore → serving (in-process)
 
 VERBS:  def ref callers super sub callgraph edges nodes identifier stat
-FLAGS:  --substr  --in S  --not-in S  --limit N  --direction up|down|both  --depth N
+FLAGS:  --substr  --in S  --not-in S  --def-in S  --limit/--max-hits N
+        --direction up|down|both  --depth N  --max-syms N  --root-limit N
 name resolution uses <serving>/scry3.names.idx (override with $SCRY4_NAMES).
 `)
 	os.Exit(2)
@@ -55,44 +56,45 @@ name resolution uses <serving>/scry3.names.idx (override with $SCRY4_NAMES).
 
 // qflags are the scry2-parity options shared by the query verbs.
 type qflags struct {
-	substr    bool
-	in, notIn string
-	limit     int
-	direction string
-	depth     int
+	substr           bool
+	in, notIn, defIn string
+	limit            int
+	direction        string
+	depth            int
+	maxSyms          int
+	rootLimit        int
 }
 
 func parseFlags(toks []string) (arg string, f qflags) {
 	f.limit, f.direction, f.depth = 50, "up", 3
+	f.maxSyms, f.rootLimit = 200, 16
+	next := func(i *int) string {
+		*i++
+		if *i < len(toks) {
+			return toks[*i]
+		}
+		return ""
+	}
 	for i := 0; i < len(toks); i++ {
 		switch toks[i] {
 		case "--substr":
 			f.substr = true
 		case "--in":
-			i++
-			if i < len(toks) {
-				f.in = toks[i]
-			}
+			f.in = next(&i)
 		case "--not-in":
-			i++
-			if i < len(toks) {
-				f.notIn = toks[i]
-			}
-		case "--limit":
-			i++
-			if i < len(toks) {
-				f.limit, _ = strconv.Atoi(toks[i])
-			}
+			f.notIn = next(&i)
+		case "--def-in":
+			f.defIn = next(&i)
+		case "--limit", "--max-hits": // --max-hits is scry2's name for the same cap
+			f.limit, _ = strconv.Atoi(next(&i))
 		case "--direction":
-			i++
-			if i < len(toks) {
-				f.direction = toks[i]
-			}
+			f.direction = next(&i)
 		case "--depth":
-			i++
-			if i < len(toks) {
-				f.depth, _ = strconv.Atoi(toks[i])
-			}
+			f.depth, _ = strconv.Atoi(next(&i))
+		case "--max-syms":
+			f.maxSyms, _ = strconv.Atoi(next(&i))
+		case "--root-limit":
+			f.rootLimit, _ = strconv.Atoi(next(&i))
 		default:
 			if arg == "" {
 				arg = toks[i]
@@ -138,7 +140,28 @@ func openEngine(serving string) (*engine, func()) {
 
 func isTicket(s string) bool { return strings.HasPrefix(s, "kythe:") }
 
-func (e *engine) resolve(name string, f qflags) []string {
+// defPath returns the file path of `ticket`'s definition (for --def-in).
+func (e *engine) defPath(ticket string) string {
+	reply, err := e.xs.CrossReferences(e.ctx, &xpb.CrossReferencesRequest{
+		Ticket:         []string{ticket},
+		DefinitionKind: xpb.CrossReferencesRequest_ALL_DEFINITIONS,
+	})
+	if err != nil {
+		return ""
+	}
+	for _, set := range reply.GetCrossReferences() {
+		for _, ra := range set.GetDefinition() {
+			if a := ra.GetAnchor(); a != nil {
+				if p := pathOf(a.GetParent()); p != "" {
+					return p
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func (e *engine) resolve(name string, f qflags, lim int) []string {
 	if isTicket(name) {
 		return []string{name}
 	}
@@ -146,11 +169,20 @@ func (e *engine) resolve(name string, f qflags) []string {
 		die("no name index (build one: scry4 <serving> name-index <entries-dir>)")
 	}
 	t := e.names.lookup(name, f.substr)
-	if len(t) == 0 {
-		die("no ticket for %q (try --substr)", name)
+	if f.defIn != "" { // keep only symbols whose definition file matches
+		var keep []string
+		for _, tk := range t {
+			if strings.Contains(e.defPath(tk), f.defIn) {
+				keep = append(keep, tk)
+			}
+		}
+		t = keep
 	}
-	if len(t) > f.limit {
-		t = t[:f.limit]
+	if len(t) == 0 {
+		die("no ticket for %q (try --substr / check --def-in)", name)
+	}
+	if lim > 0 && len(t) > lim {
+		t = t[:lim]
 	}
 	return t
 }
@@ -167,6 +199,17 @@ func sigOf(ticket string) string {
 		return u.Signature
 	}
 	return ticket
+}
+
+// label resolves a ticket to a human name via the reverse name index,
+// falling back to the signature.
+func (e *engine) label(ticket string) string {
+	if e.names != nil {
+		if n := e.names.nameOf(ticket); n != "" {
+			return n
+		}
+	}
+	return sigOf(ticket)
 }
 
 func printAnchors(ras []*xpb.CrossReferencesReply_RelatedAnchor, f qflags) int {
@@ -201,7 +244,7 @@ func (e *engine) xref(verb, name string, f qflags,
 	def xpb.CrossReferencesRequest_DefinitionKind,
 	refk xpb.CrossReferencesRequest_ReferenceKind,
 	callk xpb.CrossReferencesRequest_CallerKind) {
-	for _, t := range e.resolve(name, f) {
+	for _, t := range e.resolve(name, f, f.limit) {
 		reply, err := e.xs.CrossReferences(e.ctx, &xpb.CrossReferencesRequest{
 			Ticket:         []string{t},
 			DefinitionKind: def,
@@ -214,13 +257,13 @@ func (e *engine) xref(verb, name string, f qflags,
 		}
 		total := 0
 		for _, set := range reply.GetCrossReferences() {
-			fmt.Printf("%s %s [%s]\n", verb, name, sigOf(t))
+			fmt.Printf("%s %s [%s]\n", verb, name, e.label(t))
 			total += printAnchors(set.GetDefinition(), f)
 			total += printAnchors(set.GetReference(), f)
 			total += printAnchors(set.GetCaller(), f)
 		}
 		if total == 0 {
-			fmt.Printf("%s %s [%s]\n  (none)\n", verb, name, sigOf(t))
+			fmt.Printf("%s %s [%s]\n  (none)\n", verb, name, e.label(t))
 		}
 	}
 }
@@ -271,23 +314,23 @@ func (e *engine) inheritance(name string, f qflags, sub bool) {
 	if sub {
 		verb = "sub"
 	}
-	for _, t := range e.resolve(name, f) {
+	for _, t := range e.resolve(name, f, f.limit) {
 		n := 0
 		for _, tt := range e.edgeTargets(t, kinds) {
 			if !f.keep(pathOf(tt)) {
 				continue
 			}
 			if n == 0 {
-				fmt.Printf("%s %s [%s]\n", verb, name, sigOf(t))
+				fmt.Printf("%s %s [%s]\n", verb, name, e.label(t))
 			}
-			fmt.Printf("  %s  [%s]\n", sigOf(tt), pathOf(tt))
+			fmt.Printf("  %s  [%s]\n", e.label(tt), pathOf(tt))
 			n++
 			if n >= f.limit {
 				break
 			}
 		}
 		if n == 0 {
-			fmt.Printf("%s %s [%s]\n  (none)\n", verb, name, sigOf(t))
+			fmt.Printf("%s %s [%s]\n  (none)\n", verb, name, e.label(t))
 		}
 	}
 }
@@ -366,35 +409,56 @@ func (e *engine) next(ticket, dir string) []string {
 	}
 }
 
+// callgraph emits a BFS forest like scry2: each node has an id and a parent
+// id (roots have parent -1); every symbol appears once (its first discoverer
+// is its parent), which is cycle-safe.
 func (e *engine) callgraph(name string, f qflags) {
 	if f.direction != "up" && f.direction != "down" && f.direction != "both" {
 		die("--direction must be up|down|both")
 	}
-	visited := map[string]bool{}
-	var walk func(ticket string, depth int)
-	walk = func(ticket string, depth int) {
-		if depth > f.depth || visited[ticket] {
-			return
+	type node struct {
+		ticket string
+		parent int
+		depth  int
+	}
+	var nodes []node
+	id := map[string]int{}
+	roots := e.resolve(name, f, f.rootLimit)
+	for _, r := range roots {
+		id[r] = len(nodes)
+		nodes = append(nodes, node{r, -1, 0})
+	}
+	for qi := 0; qi < len(nodes) && len(nodes) < f.maxSyms; qi++ {
+		n := nodes[qi]
+		if n.depth >= f.depth {
+			continue
 		}
-		visited[ticket] = true
-		seen := map[string]bool{}
-		for _, nx := range e.next(ticket, f.direction) {
-			if seen[nx] || !f.keep(pathOf(nx)) {
+		for _, nx := range e.next(n.ticket, f.direction) {
+			if !f.keep(pathOf(nx)) {
 				continue
 			}
-			seen[nx] = true
-			fmt.Printf("%s%s  [%s]\n", strings.Repeat("  ", depth), sigOf(nx), pathOf(nx))
-			walk(nx, depth+1)
+			if _, seen := id[nx]; seen {
+				continue
+			}
+			id[nx] = len(nodes)
+			nodes = append(nodes, node{nx, qi, n.depth + 1})
+			if len(nodes) >= f.maxSyms {
+				break
+			}
 		}
 	}
-	for _, t := range e.resolve(name, f) {
-		fmt.Printf("callgraph %s (%s, depth %d) [%s]\n", name, f.direction, f.depth, sigOf(t))
-		walk(t, 1)
+	fmt.Printf("callgraph %s (%s, depth %d) — %d nodes\n", name, f.direction, f.depth, len(nodes))
+	for i, n := range nodes {
+		parent := "-"
+		if n.parent >= 0 {
+			parent = strconv.Itoa(n.parent)
+		}
+		fmt.Printf("[%d] parent=%s depth=%d  %s  [%s]\n", i, parent, n.depth, e.label(n.ticket), pathOf(n.ticket))
 	}
 }
 
 func (e *engine) edges(name string, f qflags) {
-	for _, t := range e.resolve(name, f) {
+	for _, t := range e.resolve(name, f, f.limit) {
 		reply, err := e.gs.Edges(e.ctx, &gpb.EdgesRequest{Ticket: []string{t}})
 		if err != nil {
 			die("edges: %v", err)
@@ -410,7 +474,7 @@ func (e *engine) edges(name string, f qflags) {
 }
 
 func (e *engine) nodes(name string, f qflags) {
-	for _, t := range e.resolve(name, f) {
+	for _, t := range e.resolve(name, f, f.limit) {
 		reply, err := e.gs.Nodes(e.ctx, &gpb.NodesRequest{Ticket: []string{t}})
 		if err != nil {
 			die("nodes: %v", err)
