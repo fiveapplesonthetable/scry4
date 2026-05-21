@@ -15,11 +15,15 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+
+	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 
 	"kythe.io/kythe/go/services/graph"
 	"kythe.io/kythe/go/services/xrefs"
@@ -31,6 +35,18 @@ import (
 	gpb "kythe.io/kythe/proto/graph_go_proto"
 	xpb "kythe.io/kythe/proto/xref_go_proto"
 )
+
+// printPB prints a proto reply as canonical Kythe JSON (matches `kythe --json`).
+func printPB(m proto.Message) {
+	b, _ := protojson.Marshal(m)
+	fmt.Println(string(b))
+}
+
+// printJSON prints any value as compact JSON.
+func printJSON(v any) {
+	b, _ := json.Marshal(v)
+	fmt.Println(string(b))
+}
 
 func die(format string, a ...any) {
 	fmt.Fprintf(os.Stderr, "scry4: "+format+"\n", a...)
@@ -63,6 +79,7 @@ type qflags struct {
 	depth            int
 	maxSyms          int
 	rootLimit        int
+	json             bool
 }
 
 func parseFlags(toks []string) (arg string, f qflags) {
@@ -79,6 +96,8 @@ func parseFlags(toks []string) (arg string, f qflags) {
 		switch toks[i] {
 		case "--substr":
 			f.substr = true
+		case "--json":
+			f.json = true
 		case "--in":
 			f.in = next(&i)
 		case "--not-in":
@@ -255,6 +274,10 @@ func (e *engine) xref(verb, name string, f qflags,
 		if err != nil {
 			die("xrefs: %v", err)
 		}
+		if f.json {
+			printPB(reply)
+			continue
+		}
 		total := 0
 		for _, set := range reply.GetCrossReferences() {
 			fmt.Printf("%s %s [%s]\n", verb, name, e.label(t))
@@ -315,9 +338,18 @@ func (e *engine) inheritance(name string, f qflags, sub bool) {
 		verb = "sub"
 	}
 	for _, t := range e.resolve(name, f, f.limit) {
+		var targets []map[string]string
 		n := 0
 		for _, tt := range e.edgeTargets(t, kinds) {
 			if !f.keep(pathOf(tt)) {
+				continue
+			}
+			if f.json {
+				targets = append(targets, map[string]string{"name": e.label(tt), "ticket": tt, "path": pathOf(tt)})
+				n++
+				if n >= f.limit {
+					break
+				}
 				continue
 			}
 			if n == 0 {
@@ -329,7 +361,9 @@ func (e *engine) inheritance(name string, f qflags, sub bool) {
 				break
 			}
 		}
-		if n == 0 {
+		if f.json {
+			printJSON(map[string]any{"verb": verb, "name": name, "ticket": t, "targets": targets})
+		} else if n == 0 {
 			fmt.Printf("%s %s [%s]\n  (none)\n", verb, name, e.label(t))
 		}
 	}
@@ -447,6 +481,15 @@ func (e *engine) callgraph(name string, f qflags) {
 			}
 		}
 	}
+	if f.json {
+		out := make([]map[string]any, len(nodes))
+		for i, n := range nodes {
+			out[i] = map[string]any{"id": i, "parent": n.parent, "depth": n.depth,
+				"name": e.label(n.ticket), "ticket": n.ticket, "path": pathOf(n.ticket)}
+		}
+		printJSON(map[string]any{"name": name, "direction": f.direction, "depth": f.depth, "nodes": out})
+		return
+	}
 	fmt.Printf("callgraph %s (%s, depth %d) — %d nodes\n", name, f.direction, f.depth, len(nodes))
 	for i, n := range nodes {
 		parent := "-"
@@ -463,6 +506,10 @@ func (e *engine) edges(name string, f qflags) {
 		if err != nil {
 			die("edges: %v", err)
 		}
+		if f.json {
+			printPB(reply)
+			continue
+		}
 		for _, es := range reply.GetEdgeSets() {
 			for kind, grp := range es.GetGroups() {
 				for _, ed := range grp.GetEdge() {
@@ -478,6 +525,10 @@ func (e *engine) nodes(name string, f qflags) {
 		reply, err := e.gs.Nodes(e.ctx, &gpb.NodesRequest{Ticket: []string{t}})
 		if err != nil {
 			die("nodes: %v", err)
+		}
+		if f.json {
+			printPB(reply)
+			continue
 		}
 		for tk, ni := range reply.GetNodes() {
 			fmt.Printf("%s\n", tk)
@@ -499,11 +550,19 @@ func (e *engine) identifier(name string, f qflags) {
 	}
 	if f.substr {
 		for _, p := range e.names.substr(name) {
-			fmt.Printf("%s\t%s\n", p.name, p.ticket)
+			if f.json {
+				printJSON(map[string]string{"name": p.name, "ticket": p.ticket})
+			} else {
+				fmt.Printf("%s\t%s\n", p.name, p.ticket)
+			}
 		}
 	} else {
 		for _, t := range e.names.lookup(name, false) {
-			fmt.Println(t)
+			if f.json {
+				printJSON(map[string]string{"name": name, "ticket": t})
+			} else {
+				fmt.Println(t)
+			}
 		}
 	}
 }
@@ -566,10 +625,18 @@ func (e *engine) repl() {
 	}
 }
 
-func (e *engine) stat(serving string) {
+func (e *engine) stat(serving string, asJSON bool) {
+	rows := 0
+	if e.names != nil {
+		rows = len(e.names.rows)
+	}
+	if asJSON {
+		printJSON(map[string]any{"serving": serving, "name_index_rows": rows})
+		return
+	}
 	fmt.Printf("serving table: %s\n", serving)
 	if e.names != nil {
-		fmt.Printf("  name index : %d rows\n", len(e.names.rows))
+		fmt.Printf("  name index : %d rows\n", rows)
 	} else {
 		fmt.Printf("  name index : (none)\n")
 	}
@@ -613,7 +680,8 @@ func main() {
 	case "repl":
 		e.repl()
 	case "stat":
-		e.stat(serving)
+		_, f := parseFlags(rest)
+		e.stat(serving, f.json)
 	default:
 		arg, f := parseFlags(rest)
 		if arg == "" {
