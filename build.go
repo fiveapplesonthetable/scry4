@@ -25,6 +25,7 @@ func buildServing(graphstore, out string) {
 	}
 	defer gs.Close(ctx)
 
+	_ = os.MkdirAll(out, 0755)
 	db, err := leveldb.Open(out, nil)
 	if err != nil {
 		die("create serving table %q: %v", out, err)

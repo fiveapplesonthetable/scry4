@@ -308,7 +308,13 @@ func indexStream(a indexArgs) {
 	}
 	fmt.Fprintf(os.Stderr, "scry4: plan: %d CUs\n", len(plan))
 
-	staging, _ := os.MkdirTemp(os.Getenv("SCRY_TMP_DIR"), "scry4-index-")
+	// Staging temp lives under /mnt/agent/tmp (the big volume) — never /tmp.
+	tmpBase := os.Getenv("SCRY_TMP_DIR")
+	if tmpBase == "" {
+		tmpBase = "/mnt/agent/tmp"
+	}
+	_ = os.MkdirAll(tmpBase, 0755)
+	staging, _ := os.MkdirTemp(tmpBase, "scry4-index-")
 	defer os.RemoveAll(staging)
 
 	// In-process GraphStore (creates if absent; reused on resume).
@@ -316,7 +322,6 @@ func indexStream(a indexArgs) {
 	if err != nil {
 		die("open graphstore: %v", err)
 	}
-	var gsMu sync.Mutex // LevelDB single-writer
 
 	// Durable name sink + done log.
 	wantNames := a.names != ""
@@ -372,6 +377,62 @@ func indexStream(a indexArgs) {
 			workers = 1
 		}
 	}
+	// Decouple indexing (parallel) from folding (serial, single LevelDB
+	// writer): workers run indexers and write each CU's entries to a temp
+	// file, then hand the path to a single folder goroutine via a bounded
+	// channel. Folding never blocks the indexers, and the bounded channel
+	// caps how many entry files sit on disk at once.
+	type job struct{ digest, path string }
+	ch := make(chan job, workers*2)
+
+	var folderWg sync.WaitGroup
+	folderWg.Add(1)
+	go func() {
+		defer folderWg.Done()
+		for j := range ch {
+			ef, err := os.Open(j.path)
+			if err != nil {
+				os.Remove(j.path)
+				continue
+			}
+			reqs := graphstore.BatchWrites(stream.ReadEntries(ef), 1024)
+			for req := range reqs {
+				_ = gs.Write(ctx, req) // single writer — no mutex needed
+				if !wantNames {
+					continue
+				}
+				ticket := kytheuri.ToString(req.GetSource())
+				for _, u := range req.GetUpdate() {
+					if u.GetEdgeKind() == "/kythe/edge/named" && u.GetTarget().GetSignature() != "" {
+						sig := u.GetTarget().GetSignature()
+						addName(sig, ticket)
+						if p, ok := stripJVMDesc(sig); ok {
+							addName(p, ticket)
+						}
+					} else if u.GetFactName() == "/kythe/code" && len(u.GetFactValue()) > 0 {
+						var ms cpb.MarkedSource
+						if proto.Unmarshal(u.GetFactValue(), &ms) == nil {
+							if si := markedsource.RenderQualifiedName(&ms); si.GetQualifiedName() != "" {
+								addName(si.GetQualifiedName(), ticket)
+							}
+						}
+					}
+				}
+			}
+			ef.Close()
+			os.Remove(j.path)
+			stats.mu.Lock()
+			stats.ok++
+			stats.mu.Unlock()
+			logDone(j.digest)
+			n := atomic.AddInt64(&idxDone, 1)
+			if n%200 == 0 {
+				fmt.Fprintf(os.Stderr, "scry4: folded %d/%d (graphstore %s)\n", n, len(plan),
+					func() string { fi, _ := os.Stat(a.graphstore); _ = fi; return "" }())
+			}
+		}
+	}()
+
 	var next int64 = -1
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
@@ -385,6 +446,7 @@ func indexStream(a indexArgs) {
 				}
 				c := plan[int(i)]
 				sub := filepath.Join(staging, c.digest+".kzip")
+				ent := filepath.Join(staging, c.digest+".entries")
 				jvmTmp := filepath.Join(staging, c.digest+".jvmtmp")
 				if c.lang == "java" || c.lang == "jvm" {
 					_ = os.MkdirAll(jvmTmp, 0755)
@@ -415,49 +477,20 @@ func indexStream(a indexArgs) {
 				if err := writeSubKzip(rd, cuc, c.index, sub); err != nil {
 					stats.fail(fmt.Sprintf("digest=%s subkzip: %v", c.digest, err))
 					os.Remove(sub)
-					atomic.AddInt64(&idxDone, 1)
 					continue
 				}
 				cmd, _ := indexerCmd(a.kytheRoot, c.lang, sub, a.jvmHeap, jvmTmp)
-				stdout, _ := cmd.StdoutPipe()
-				var stderr strings.Builder
-				cmd.Stderr = &stderr
-				if err := cmd.Start(); err != nil {
-					stats.fail(fmt.Sprintf("digest=%s start: %v", c.digest, err))
+				outF, ferr := os.Create(ent)
+				if ferr != nil {
+					stats.fail(fmt.Sprintf("digest=%s create: %v", c.digest, ferr))
 					os.Remove(sub)
-					atomic.AddInt64(&idxDone, 1)
 					continue
 				}
-				// Single pass: fold entries into the GraphStore + extract names.
-				reqs := graphstore.BatchWrites(stream.ReadEntries(stdout), 1024)
-				nWrites := 0
-				for req := range reqs {
-					gsMu.Lock()
-					_ = gs.Write(ctx, req)
-					gsMu.Unlock()
-					nWrites++
-					if !wantNames {
-						continue
-					}
-					ticket := kytheuri.ToString(req.GetSource())
-					for _, u := range req.GetUpdate() {
-						if u.GetEdgeKind() == "/kythe/edge/named" && u.GetTarget().GetSignature() != "" {
-							sig := u.GetTarget().GetSignature()
-							addName(sig, ticket)
-							if p, ok := stripJVMDesc(sig); ok {
-								addName(p, ticket)
-							}
-						} else if u.GetFactName() == "/kythe/code" && len(u.GetFactValue()) > 0 {
-							var ms cpb.MarkedSource
-							if proto.Unmarshal(u.GetFactValue(), &ms) == nil {
-								if si := markedsource.RenderQualifiedName(&ms); si.GetQualifiedName() != "" {
-									addName(si.GetQualifiedName(), ticket)
-								}
-							}
-						}
-					}
-				}
-				werr := cmd.Wait()
+				cmd.Stdout = outF // indexer stdout → file (no fold contention)
+				var stderr strings.Builder
+				cmd.Stderr = &stderr
+				werr := cmd.Run()
+				outF.Close()
 				os.Remove(sub)
 				os.RemoveAll(jvmTmp)
 				if werr != nil {
@@ -466,24 +499,23 @@ func indexStream(a indexArgs) {
 						tail = tail[len(tail)-200:]
 					}
 					stats.fail(fmt.Sprintf("digest=%s exit: %v %s", c.digest, werr, strings.ReplaceAll(tail, "\n", " ")))
-				} else if nWrites == 0 {
+					os.Remove(ent)
+					continue
+				}
+				if fi, _ := os.Stat(ent); fi == nil || fi.Size() == 0 {
 					stats.mu.Lock()
 					stats.empty++
 					stats.mu.Unlock()
-				} else {
-					stats.mu.Lock()
-					stats.ok++
-					stats.mu.Unlock()
-					logDone(c.digest)
+					os.Remove(ent)
+					continue
 				}
-				n := atomic.AddInt64(&idxDone, 1)
-				if n%200 == 0 {
-					fmt.Fprintf(os.Stderr, "scry4: indexed %d/%d\n", n, len(plan))
-				}
+				ch <- job{c.digest, ent} // blocks if folder behind (backpressure)
 			}
 		}()
 	}
 	wg.Wait()
+	close(ch)
+	folderWg.Wait()
 	if wantNames {
 		nameFile.Flush()
 	}
@@ -499,6 +531,7 @@ func indexStream(a indexArgs) {
 	if err != nil {
 		die("reopen graphstore: %v", err)
 	}
+	_ = os.MkdirAll(a.out, 0755) // leveldb creates the db dir's contents, not its parents
 	db, err := leveldb.Open(a.out, nil)
 	if err != nil {
 		die("create serving: %v", err)
