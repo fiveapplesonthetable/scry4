@@ -92,11 +92,23 @@ table in-process, then query with scry4.
 * To **build at AOSP scale on a normal disk** → **scry3 `index-stream`**
   (then optionally `scry4 build` + query).
 
+## Standalone
+
+scry4 does **not** depend on scry3. Its own `index-stream` builds the serving
+table from a kzip fully in-process — Kythe's Go kzip reader yields CUs, the
+indexer binaries run per CU, entries fold straight into a LevelDB GraphStore
+in-process (no `write_entries`), and the serving table is built via the Kythe
+serving pipeline in-process (no `write_tables`). Bounded disk + RAM, resumable
+with `--resume`. So the whole pipeline is one Go binary + the Kythe indexer
+binaries.
+
 ## Reproduce
 
 ```bash
-# serving table + name index, bounded disk:
-scry3 index-stream --kzip K --out S --keep-graphstore --in <dirs>
+export KYTHE_ROOT=/path/to/kythe-v0.0.75   # patched indexers
+# build serving + name index from a kzip, in-process (bounded disk/RAM, resumable):
+scry4 OUT.serving index-stream --kzip K --in <dirs> \
+      --langs cxx,java,jvm --jvm-heap 12g --workers 24 [--resume]
 # query in-process:
-scry4 S repl     # or: scry4 S def NAME / ref NAME / callers NAME
+scry4 OUT.serving repl     # or: scry4 OUT.serving def NAME / ref NAME / callgraph NAME
 ```

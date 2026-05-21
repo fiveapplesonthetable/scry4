@@ -600,6 +600,10 @@ func main() {
 		}
 		buildServing(rest[0], serving)
 		return
+	case "index-stream":
+		// scry4 <out-serving> index-stream --kzip K --kythe-root R [flags]
+		runIndexStream(serving, rest)
+		return
 	}
 
 	e, closeFn := openEngine(serving)

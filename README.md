@@ -52,14 +52,35 @@ scry4 <serving> edges NAME / nodes NAME / identifier NAME
 scry4 <serving> repl                       # warm in-process loop — the fast path
 scry4 <serving> stat
 
-# build helpers
+# build pipeline (standalone — depends only on Kythe, not scry3)
+scry4 <out-serving> index-stream --kzip K [--kythe-root R] \
+      [--in d1,d2] [--not-in d] [--langs cxx,java,jvm] [--jvm-heap 12g] \
+      [--workers N] [--inject-cu-arg PFX::ARG] [--resume] [--keep-graphstore]
 scry4 <serving> name-index <entries-dir> [out]   # Go name index (markedsource)
 scry4 <serving> build      <graphstore-dir>      # graphstore → serving, in-process
 ```
 
+`index-stream` is scry4's **own** kzip → serving pipeline, fully in-process:
+Kythe's Go kzip reader yields CUs, the matching indexer binary runs per CU,
+and its entries are folded **straight into a LevelDB GraphStore in-process**
+(no `write_entries`) while names are extracted in the same pass; the serving
+table is then built in-process via the Kythe serving pipeline (no
+`write_tables`). Peak disk is the GraphStore + serving table (bounded), and
+it resumes via `--resume` (reuses the GraphStore, skips `<gs>.done`, preloads
+`<gs>.names`). So scry4 needs nothing from scry3.
+
 Name resolution uses `<serving>/scry3.names.idx` by default (`$SCRY4_NAMES`
-to override). Indexing (kzip → entries/GraphStore) is shared with scry3 —
-run `scry3 index-stream --keep-graphstore`, then `scry4 build` and query.
+to override).
+
+## Throughput vs. OOM
+
+`--workers` (default: half the cores, like scry2) bounds concurrent indexer
+subprocesses — the memory ceiling is roughly
+`(concurrent JVM indexers × --jvm-heap) + (cxx_indexer RSS × workers)`. Raise
+`--workers` for throughput; lower it or `--jvm-heap` if you approach RAM. The
+GraphStore fold, name set, and serving build are all bounded/streamed, so the
+indexer subprocesses are the only real memory knob. Example (157 GB box):
+`--workers 24 --jvm-heap 12g`.
 
 ## Build
 
